@@ -41,6 +41,7 @@ class AudioRecorder:
     """Records system audio using macOS ScreenCaptureKit API.
 
     This captures all system audio output without requiring virtual audio devices.
+    Optionally captures microphone input as well.
     Requires macOS 13.0+ and Screen Recording permission.
     """
 
@@ -49,9 +50,11 @@ class AudioRecorder:
         sample_rate: int = 16000,
         channels: int = 1,
         recordings_dir: Optional[Path] = None,
+        capture_microphone: bool = False,
     ):
         self.sample_rate = sample_rate
         self.channels = channels
+        self.capture_microphone = capture_microphone
         self.recordings_dir = recordings_dir or Path.home() / ".audio-transcriber" / "recordings"
         self.recordings_dir.mkdir(parents=True, exist_ok=True)
 
@@ -113,12 +116,16 @@ class AudioRecorder:
             display, [], []
         )
 
-        # Configure stream for audio capture only
+        # Configure stream for audio capture
         config = SCStreamConfiguration.alloc().init()
         config.setCapturesAudio_(True)
         config.setExcludesCurrentProcessAudio_(True)  # Don't capture our own audio
         config.setSampleRate_(self.sample_rate)
         config.setChannelCount_(self.channels)
+
+        # Optionally capture microphone input
+        if self.capture_microphone:
+            config.setCaptureMicrophone_(True)
 
         # Minimize video capture since we only want audio
         config.setCaptureResolution_(SCCaptureResolutionNominal)

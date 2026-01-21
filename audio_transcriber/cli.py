@@ -28,19 +28,22 @@ def main():
 @main.command()
 @click.option("--model", "-m", default="base", help="Whisper model: tiny, base, small, medium, large")
 @click.option("--language", "-l", default=None, help="Language code (e.g., 'en', 'sv'). Auto-detects if not specified.")
-def record(model: str, language: Optional[str]):
+@click.option("--mic", is_flag=True, help="Also capture microphone input")
+def record(model: str, language: Optional[str], mic: bool):
     """Start recording system audio. Press Ctrl+C to stop and transcribe.
 
     This captures all audio playing on your system using macOS ScreenCaptureKit.
+    Use --mic to also capture microphone input.
     Requires Screen Recording permission (will be requested on first run).
     """
-    recorder = AudioRecorder()
+    recorder = AudioRecorder(capture_microphone=mic)
     transcriber = Transcriber(model_name=model)
 
+    mic_status = " + microphone" if mic else ""
     console.print(Panel.fit(
-        "[bold green]Starting system audio recording...[/bold green]\n"
+        f"[bold green]Starting audio recording{mic_status}...[/bold green]\n"
         "Press [bold yellow]Ctrl+C[/bold yellow] to stop recording and transcribe.\n\n"
-        "[dim]Using ScreenCaptureKit - captures all system audio output.[/dim]",
+        f"[dim]Using ScreenCaptureKit - captures system audio{mic_status}.[/dim]",
         title="Audio Transcriber",
     ))
 
@@ -99,7 +102,8 @@ def record(model: str, language: Optional[str]):
             result = transcriber.transcribe(audio_file, language=language)
 
         if result["text"].strip():
-            console.print("\n" + Panel.fit(
+            console.print()
+            console.print(Panel.fit(
                 result["text"],
                 title=f"Transcription (Language: {result['language']})",
                 border_style="green",
@@ -126,7 +130,8 @@ def transcribe(audio_file: Path, model: str, language: Optional[str]):
     with console.status("[bold cyan]Processing with Whisper..."):
         result = transcriber.transcribe(audio_file, language=language)
 
-    console.print("\n" + Panel.fit(
+    console.print()
+    console.print(Panel.fit(
         result["text"],
         title=f"Transcription (Language: {result['language']})",
         border_style="green",

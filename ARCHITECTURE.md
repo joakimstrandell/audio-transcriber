@@ -59,6 +59,7 @@ Uses macOS ScreenCaptureKit to capture system audio without requiring virtual au
 - Sample rate: 16kHz (optimal for Whisper)
 - Channels: 1 (mono)
 - Format: 16-bit PCM WAV
+- Optional microphone capture (--mic flag)
 
 ### 2. Transcriber (transcriber.py)
 
@@ -86,6 +87,9 @@ Built with Click and Rich for a nice terminal experience.
 
 **Commands:**
 - `transcriber record` - Start recording, Ctrl+C to stop and transcribe
+  - `--mic` - Also capture microphone input
+  - `-m/--model` - Whisper model size (tiny, base, small, medium, large)
+  - `-l/--language` - Language code (auto-detects if not specified)
 - `transcriber transcribe <file>` - Transcribe existing audio file
 - `transcriber list` - List all saved transcriptions
 - `transcriber show <id>` - View specific transcription
@@ -155,8 +159,11 @@ ScreenCaptureKit provides:
 
 The app requires **Screen Recording** permission because ScreenCaptureKit's audio capture is tied to screen capture APIs (even though we minimize video capture to 2x2 pixels at 1fps).
 
-Grant permission via:
-System Settings → Privacy & Security → Screen Recording → [Your Terminal App]
+When using `--mic`, **Microphone** permission is also required.
+
+Grant permissions via:
+- System Settings → Privacy & Security → Screen Recording → [Your Terminal App]
+- System Settings → Privacy & Security → Microphone → [Your Terminal App] (if using --mic)
 
 ## Future Improvements
 
@@ -167,4 +174,3 @@ Potential enhancements:
 - [ ] Export to SRT/VTT subtitles
 - [ ] Web UI for playback with synced transcript
 - [ ] Configurable audio quality settings
-- [ ] Microphone + system audio mixing
