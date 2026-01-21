@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "audio-transcriber"
+version = "0.2.0"
+description = "CLI tool to record system audio and transcribe it using Whisper"
+requires-python = ">=3.9"
+dependencies = [
+    "pyobjc-core>=10.0",
+    "pyobjc-framework-ScreenCaptureKit>=10.0",
+    "pyobjc-framework-AVFoundation>=10.0",
+    "pyobjc-framework-CoreMedia>=10.0",
+    "numpy>=1.24.0",
+    "openai-whisper>=20231117",
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    "scipy>=1.10.0",
+]
+
+[project.scripts]
+transcriber = "audio_transcriber.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
