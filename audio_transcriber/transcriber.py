@@ -71,7 +71,7 @@ class Transcriber:
             audio_data = signal.resample(audio_data, num_samples)
 
         # Transcribe the audio
-        options = {}
+        options = {"fp16": False}  # Avoid FP16 warning on CPU
         if language:
             options["language"] = language
 

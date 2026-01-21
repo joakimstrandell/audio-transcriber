@@ -1,7 +1,10 @@
 """Command-line interface for audio transcriber."""
 
+import json
 import sys
+import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -14,6 +17,7 @@ from rich.text import Text
 
 from .recorder import AudioRecorder
 from .transcriber import Transcriber
+from .streaming import StreamingRecorderTranscriber
 
 console = Console()
 
@@ -139,6 +143,161 @@ def transcribe(audio_file: Path, model: str, language: Optional[str]):
 
     console.print(f"\n[green]Transcription saved to:[/green]")
     console.print(f"  [dim]{result['output_file']}[/dim]")
+
+
+@main.command()
+@click.option("--model", "-m", default="base", help="Whisper model: tiny, base, small, medium, large-v2, large-v3")
+@click.option("--language", "-l", default=None, help="Language code (e.g., 'en', 'sv'). Auto-detects if not specified.")
+@click.option("--mic", is_flag=True, help="Also capture microphone input")
+@click.option("--chunk", "-c", default=5.0, help="Chunk duration in seconds for streaming (default: 5.0)")
+def stream(model: str, language: Optional[str], mic: bool, chunk: float):
+    """Start recording with real-time streaming transcription.
+
+    Uses faster-whisper to transcribe audio in chunks while recording continues.
+    Partial transcription results are displayed as they become available.
+
+    Press Ctrl+C to stop recording.
+    """
+    # Track transcription segments for display
+    transcript_lines = []
+    transcript_lock = threading.Lock()
+
+    def on_transcript(text: str, is_partial: bool):
+        """Callback for new transcription segments."""
+        with transcript_lock:
+            transcript_lines.append(text)
+
+    # Initialize the streaming recorder-transcriber
+    streamer = StreamingRecorderTranscriber(
+        model_name=model,
+        language=language,
+        capture_microphone=mic,
+        chunk_duration=chunk,
+    )
+
+    mic_status = " + microphone" if mic else ""
+    console.print(Panel.fit(
+        f"[bold green]Starting streaming transcription{mic_status}...[/bold green]\n"
+        "Press [bold yellow]Ctrl+C[/bold yellow] to stop recording.\n\n"
+        f"[dim]Using faster-whisper for real-time transcription.[/dim]\n"
+        f"[dim]Processing audio in {chunk:.1f}-second chunks.[/dim]",
+        title="Streaming Transcriber",
+    ))
+
+    # Load model before starting
+    with console.status("[bold cyan]Loading faster-whisper model..."):
+        streamer.load_model()
+
+    try:
+        audio_file = streamer.start(on_transcript=on_transcript)
+        console.print(f"[dim]Recording to: {audio_file}[/dim]\n")
+        console.print("[bold cyan]Live Transcription:[/bold cyan]\n")
+
+        # Show recording status and live transcription
+        start_time = time.time()
+        last_line_count = 0
+
+        with Live(console=console, refresh_per_second=4) as live:
+            while True:
+                elapsed = time.time() - start_time
+                minutes = int(elapsed // 60)
+                seconds = int(elapsed % 60)
+
+                # Build the display
+                display = Text()
+
+                # Status line
+                error = streamer.get_error()
+                if error:
+                    display.append("Recording... ", style="bold red")
+                    display.append(f"{minutes:02d}:{seconds:02d}", style="bold cyan")
+                    display.append(f" [Warning: {error}]", style="yellow")
+                else:
+                    display.append("Recording... ", style="bold red")
+                    display.append(f"{minutes:02d}:{seconds:02d}", style="bold cyan")
+
+                display.append("\n\n")
+
+                # Show transcription so far
+                with transcript_lock:
+                    if transcript_lines:
+                        current_text = " ".join(transcript_lines)
+                        display.append(current_text, style="white")
+
+                        # Show indicator if new text arrived
+                        if len(transcript_lines) > last_line_count:
+                            display.append(" ", style="default")
+                            display.append("[new]", style="bold green")
+                            last_line_count = len(transcript_lines)
+                    else:
+                        display.append("[dim]Waiting for speech...[/dim]")
+
+                live.update(display)
+                time.sleep(0.25)
+
+    except KeyboardInterrupt:
+        pass
+    except RuntimeError as e:
+        console.print(f"\n[red]Error: {e}[/red]")
+        if "Screen Recording permission" in str(e) or "No displays found" in str(e):
+            console.print("\n[yellow]To grant Screen Recording permission:[/yellow]")
+            console.print("  1. Open System Settings > Privacy & Security > Screen Recording")
+            console.print("  2. Enable permission for your terminal app")
+            console.print("  3. Restart your terminal and try again")
+        return
+
+    console.print("\n\n[yellow]Stopping recording...[/yellow]")
+    audio_file, final_text = streamer.stop()
+
+    if audio_file and audio_file.exists():
+        duration = streamer.get_recording_duration()
+        console.print(f"[green]Audio saved to: {audio_file}[/green]")
+        console.print(f"[dim]Duration: {duration:.1f} seconds[/dim]\n")
+
+        if final_text.strip():
+            console.print()
+            console.print(Panel.fit(
+                final_text,
+                title="Final Transcription",
+                border_style="green",
+            ))
+
+            # Save the transcription
+            transcriber = Transcriber(model_name=model)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            transcription_data = {
+                "id": timestamp,
+                "timestamp": datetime.now().isoformat(),
+                "audio_file": str(audio_file),
+                "text": final_text,
+                "language": language or "auto",
+                "model": model,
+                "streaming": True,
+            }
+
+            # Save plain text file
+            text_path = transcriber.transcriptions_dir / f"transcription_{timestamp}.txt"
+            with open(text_path, "w") as f:
+                f.write(f"Transcription (Streaming) - {transcription_data['timestamp']}\n")
+                f.write(f"Audio file: {transcription_data['audio_file']}\n")
+                f.write(f"Language: {transcription_data['language']}\n")
+                f.write(f"Model: {transcription_data['model']}\n")
+                f.write("-" * 50 + "\n\n")
+                f.write(final_text)
+                f.write("\n")
+
+            # Save JSON file
+            json_path = transcriber.transcriptions_dir / f"transcription_{timestamp}.json"
+            with open(json_path, "w") as f:
+                json.dump(transcription_data, f, indent=2)
+
+            console.print(f"\n[green]Transcription saved to:[/green]")
+            console.print(f"  [dim]{text_path}[/dim]")
+        else:
+            console.print("\n[yellow]No speech detected in the recording.[/yellow]")
+    else:
+        console.print("[red]No audio was recorded.[/red]")
+        console.print("[dim]Make sure some audio is playing on your system during recording.[/dim]")
 
 
 @main.command(name="list")
