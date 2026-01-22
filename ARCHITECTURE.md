@@ -14,25 +14,28 @@ A CLI tool that captures system audio on macOS using ScreenCaptureKit and transc
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                         CLI (cli.py)                         │
-│  Commands: record, transcribe, list, show, check, path      │
-└─────────────────────┬───────────────────┬───────────────────┘
-                      │                   │
-                      ▼                   ▼
-┌─────────────────────────────┐ ┌─────────────────────────────┐
-│     AudioRecorder           │ │     Transcriber             │
-│     (recorder.py)           │ │     (transcriber.py)        │
-├─────────────────────────────┤ ├─────────────────────────────┤
-│ - ScreenCaptureKit API      │ │ - OpenAI Whisper (local)    │
-│ - System audio capture      │ │ - Multi-language support    │
-│ - WAV file output           │ │ - JSON + TXT output         │
-└─────────────────────────────┘ └─────────────────────────────┘
-                      │                   │
-                      ▼                   ▼
-              ~/.audio-transcriber/
-              ├── recordings/       # WAV files
-              └── transcriptions/   # JSON + TXT files
+┌──────────────────────────────────────────────────────────────────────┐
+│                            CLI (cli.py)                               │
+│  Commands: record, stream, transcribe, list, show, check, path       │
+└───────────────┬───────────────────┬───────────────────┬──────────────┘
+                │                   │                   │
+                ▼                   ▼                   ▼
+┌───────────────────────┐ ┌───────────────────┐ ┌──────────────────────┐
+│    AudioRecorder      │ │    Transcriber    │ │ StreamingTranscriber │
+│    (recorder.py)      │ │  (transcriber.py) │ │   (streaming.py)     │
+├───────────────────────┤ ├───────────────────┤ ├──────────────────────┤
+│ - ScreenCaptureKit    │ │ - openai-whisper  │ │ - faster-whisper     │
+│ - System audio capture│ │ - Batch processing│ │ - Real-time chunks   │
+│ - Microphone capture  │ │ - JSON + TXT out  │ │ - VAD filtering      │
+│ - WAV file output     │ │                   │ │ - Background thread  │
+└───────────────────────┘ └───────────────────┘ └──────────────────────┘
+                │                   │                   │
+                └───────────────────┴───────────────────┘
+                                    │
+                                    ▼
+                        ~/.audio-transcriber/
+                        ├── recordings/       # WAV files
+                        └── transcriptions/   # JSON + TXT files
 ```
 
 ## Key Components
@@ -81,7 +84,29 @@ Uses OpenAI Whisper for local speech-to-text transcription.
 | medium | 769 MB | Slow     | High     |
 | large  | 1.5 GB | Slowest  | Highest  |
 
-### 3. CLI (cli.py)
+### 3. StreamingTranscriber (streaming.py)
+
+Uses faster-whisper for real-time streaming transcription while recording.
+
+**Key classes:**
+- `StreamingTranscriber` - Handles chunked audio processing and transcription
+- `StreamingRecorderTranscriber` - Combines AudioRecorder with streaming transcription
+
+**How it works:**
+1. Hooks into AudioRecorder to receive audio samples in real-time
+2. Buffers audio in configurable chunks (default 5 seconds)
+3. Processes chunks in a background thread using faster-whisper
+4. Uses VAD (Voice Activity Detection) to filter non-speech
+5. Maintains 1-second overlap between chunks for better continuity
+6. Calls user-provided callback with transcription results
+
+**Configuration:**
+- Chunk duration: Configurable (default 5.0 seconds)
+- Overlap: 1 second between chunks
+- VAD: Enabled with 500ms minimum silence duration
+- Compute type: float32 (avoids FP16 warnings on CPU/macOS)
+
+### 4. CLI (cli.py)
 
 Built with Click and Rich for a nice terminal experience.
 
@@ -90,6 +115,11 @@ Built with Click and Rich for a nice terminal experience.
   - `--mic` - Also capture microphone input
   - `-m/--model` - Whisper model size (tiny, base, small, medium, large)
   - `-l/--language` - Language code (auto-detects if not specified)
+- `transcriber stream` - Start recording with real-time streaming transcription
+  - `--mic` - Also capture microphone input
+  - `-m/--model` - Whisper model size (tiny, base, small, medium, large-v2, large-v3)
+  - `-l/--language` - Language code (auto-detects if not specified)
+  - `-c/--chunk` - Chunk duration in seconds (default: 5.0)
 - `transcriber transcribe <file>` - Transcribe existing audio file
 - `transcriber list` - List all saved transcriptions
 - `transcriber show <id>` - View specific transcription
@@ -97,6 +127,8 @@ Built with Click and Rich for a nice terminal experience.
 - `transcriber path` - Show storage directories
 
 ## Data Flow
+
+### Batch Mode (`transcriber record`)
 
 ```
 1. User runs: transcriber record
@@ -128,6 +160,34 @@ Built with Click and Rich for a nice terminal experience.
    ~/.audio-transcriber/transcriptions/transcription_YYYYMMDD_HHMMSS.json
 ```
 
+### Streaming Mode (`transcriber stream`)
+
+```
+1. User runs: transcriber stream
+                    │
+                    ▼
+2. faster-whisper model loaded
+                    │
+                    ▼
+3. ScreenCaptureKit starts capturing ──────────────────┐
+                    │                                  │
+                    ▼                                  ▼
+4. Audio samples buffered ◄───────────────► Background thread processes
+   (5-second chunks)                        chunks with faster-whisper
+                    │                                  │
+                    │                                  ▼
+                    │                        Live transcription displayed
+                    │                                  │
+                    ▼                                  │
+5. User presses Ctrl+C ◄───────────────────────────────┘
+                    │
+                    ▼
+6. Audio saved to WAV file
+                    │
+                    ▼
+7. Final transcription saved
+```
+
 ## Dependencies
 
 ```
@@ -137,7 +197,8 @@ pyobjc-framework-AVFoundation     - Audio format handling
 pyobjc-framework-CoreMedia        - Media buffer handling
 numpy                    - Audio data processing
 scipy                    - Signal processing
-openai-whisper           - Speech-to-text model
+openai-whisper           - Batch speech-to-text (used by `record` command)
+faster-whisper           - Streaming speech-to-text (used by `stream` command)
 click                    - CLI framework
 rich                     - Terminal formatting
 ```
@@ -168,7 +229,7 @@ Grant permissions via:
 ## Future Improvements
 
 Potential enhancements:
-- [ ] Real-time transcription (stream to Whisper)
+- [x] Real-time transcription (`transcriber stream` command)
 - [ ] Audio-only mode without display filter (if API supports)
 - [ ] Speaker diarization (who said what)
 - [ ] Export to SRT/VTT subtitles
