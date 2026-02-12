@@ -33,9 +33,7 @@ class Transcriber:
     def _load_model(self):
         """Load the Whisper model (lazy loading)."""
         if self.model is None:
-            print(f"Loading Whisper model '{self.model_name}'...")
             self.model = whisper.load_model(self.model_name)
-            print("Model loaded.")
 
     def transcribe(
         self,

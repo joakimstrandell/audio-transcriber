@@ -22,6 +22,8 @@ class StreamingTranscriber:
         device: str = "auto",
         compute_type: str = "float32",  # Avoid float16 warning on CPU/macOS
         language: Optional[str] = None,
+        vad_filter: bool = True,
+        vad_threshold: float = 0.3,  # Lower = more sensitive (default 0.5 is too aggressive for mic)
     ):
         """Initialize the streaming transcriber.
 
@@ -30,11 +32,15 @@ class StreamingTranscriber:
             device: Device to use for inference. Options: auto, cpu, cuda
             compute_type: Compute type for inference. Options: default, float16, int8
             language: Language code for transcription. If None, auto-detects.
+            vad_filter: Whether to use Voice Activity Detection to filter non-speech.
+            vad_threshold: VAD threshold (0.0-1.0). Lower = more sensitive to quiet speech.
         """
         self.model_name = model_name
         self.device = device
         self.compute_type = compute_type
         self.language = language
+        self.vad_filter = vad_filter
+        self.vad_threshold = vad_threshold
         self.model: Optional[WhisperModel] = None
 
         # Streaming state
@@ -61,13 +67,11 @@ class StreamingTranscriber:
     def _load_model(self):
         """Load the faster-whisper model (lazy loading)."""
         if self.model is None:
-            print(f"Loading faster-whisper model '{self.model_name}'...")
             self.model = WhisperModel(
                 self.model_name,
                 device=self.device,
                 compute_type=self.compute_type,
             )
-            print("Model loaded.")
 
     def load_model(self):
         """Public method to pre-load the model."""
@@ -164,14 +168,19 @@ class StreamingTranscriber:
 
         try:
             # Transcribe with faster-whisper
+            # VAD parameters tuned for microphone input (lower threshold = more sensitive)
+            vad_params = dict(
+                threshold=self.vad_threshold,
+                min_silence_duration_ms=300,  # Shorter silence detection
+                speech_pad_ms=200,  # Padding around speech
+            ) if self.vad_filter else None
+
             segments, info = self.model.transcribe(
                 audio,
                 language=self.language,
                 beam_size=5,
-                vad_filter=True,  # Filter out non-speech
-                vad_parameters=dict(
-                    min_silence_duration_ms=500,
-                ),
+                vad_filter=self.vad_filter,
+                vad_parameters=vad_params,
             )
 
             # Collect text from segments
@@ -251,6 +260,8 @@ class StreamingRecorderTranscriber:
         language: Optional[str] = None,
         capture_microphone: bool = False,
         chunk_duration: float = 5.0,
+        vad_filter: bool = True,
+        vad_threshold: Optional[float] = None,
     ):
         """Initialize the streaming recorder-transcriber.
 
@@ -261,15 +272,28 @@ class StreamingRecorderTranscriber:
             language: Optional language code for transcription.
             capture_microphone: Whether to also capture microphone input.
             chunk_duration: Duration of audio chunks to process in seconds.
+            vad_filter: Whether to use Voice Activity Detection.
+            vad_threshold: VAD threshold (0.0-1.0). If None, uses 0.2 for mic, 0.3 otherwise.
         """
         from .recorder import AudioRecorder
 
         self.recorder = AudioRecorder(capture_microphone=capture_microphone)
+
+        # Disable VAD by default for microphone input (mic levels are too low for VAD)
+        # VAD works well for system audio but filters out quiet mic speech
+        if capture_microphone and vad_filter:
+            vad_filter = False  # Disable VAD for mic by default
+
+        if vad_threshold is None:
+            vad_threshold = 0.2 if capture_microphone else 0.3
+
         self.transcriber = StreamingTranscriber(
             model_name=model_name,
             device=device,
             compute_type=compute_type,
             language=language,
+            vad_filter=vad_filter,
+            vad_threshold=vad_threshold,
         )
         self.transcriber.chunk_duration = chunk_duration
         self.transcriber.min_chunk_samples = int(chunk_duration * self.transcriber.sample_rate)
@@ -301,23 +325,44 @@ class StreamingRecorderTranscriber:
 
         # Hook into the recorder's audio handling to feed transcriber
         self._original_handle_audio = self.recorder._handle_audio
+        self._original_mic_callback = self.recorder._mic_callback
 
         def hooked_handle_audio(sample_buffer):
             # Call original handler to store audio
             self._original_handle_audio(sample_buffer)
 
-            # Also feed to transcriber - get the latest chunk
+            # Feed system audio to transcriber (only if not using mic)
+            if not self.recorder.capture_microphone:
+                with self.recorder._lock:
+                    if self.recorder._audio_data:
+                        latest_chunk = self.recorder._audio_data[-1]
+                        self.transcriber.add_audio(latest_chunk)
+
+        def hooked_mic_callback(indata, frames, time_info, status):
+            # Call original handler to store audio
+            self._original_mic_callback(indata, frames, time_info, status)
+
+            # Feed mic audio to transcriber
             with self.recorder._lock:
-                if self.recorder._audio_data:
-                    # Feed the latest audio chunk to the transcriber
-                    latest_chunk = self.recorder._audio_data[-1]
+                if self.recorder._mic_data:
+                    latest_chunk = self.recorder._mic_data[-1]
                     self.transcriber.add_audio(latest_chunk)
 
         self.recorder._handle_audio = hooked_handle_audio
+        self.recorder._mic_callback = hooked_mic_callback
 
         # Start recording
         self._running = True
-        return self.recorder.start()
+        result = self.recorder.start()
+
+        # Re-hook mic callback after start() creates the sounddevice stream
+        # because start() replaces _mic_callback with a new reference
+        if self.recorder._mic_stream:
+            # The sounddevice stream uses a callback reference, we need to monkey-patch
+            # the instance method that gets called
+            self.recorder._mic_callback = hooked_mic_callback
+
+        return result
 
     def stop(self) -> Tuple[Optional[Path], str]:
         """Stop recording and transcription.
@@ -362,3 +407,7 @@ class StreamingRecorderTranscriber:
             Tuples of (result_type, text).
         """
         yield from self.transcriber.get_results(block=block, timeout=timeout)
+
+    def get_audio_levels(self) -> tuple[float, float]:
+        """Get current audio levels (peak, rms) for monitoring."""
+        return self.recorder.get_audio_levels()

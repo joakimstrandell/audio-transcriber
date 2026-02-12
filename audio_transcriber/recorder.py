@@ -41,7 +41,7 @@ class AudioRecorder:
     """Records system audio using macOS ScreenCaptureKit API.
 
     This captures all system audio output without requiring virtual audio devices.
-    Optionally captures microphone input as well.
+    Optionally captures microphone input as well (using sounddevice).
     Requires macOS 13.0+ and Screen Recording permission.
     """
 
@@ -67,6 +67,14 @@ class AudioRecorder:
         self._error: Optional[str] = None
         self._audio_queue = objc.objc_object(c_void_p=_dispatch_queue_create(b"com.audio-transcriber.audio", None))
 
+        # Audio level monitoring
+        self._peak_level: float = 0.0
+        self._rms_level: float = 0.0
+
+        # Microphone capture (using sounddevice instead of ScreenCaptureKit)
+        self._mic_stream = None
+        self._mic_data: list = []
+
     def _get_shareable_content(self) -> Optional[SCShareableContent]:
         """Get shareable content (displays, windows, apps) synchronously."""
         content_holder = {"content": None, "error": None}
@@ -89,6 +97,23 @@ class AudioRecorder:
 
         return content_holder["content"]
 
+    def _mic_callback(self, indata, frames, time_info, status):
+        """Callback for sounddevice microphone input."""
+        if not self._recording:
+            return
+
+        # Copy the audio data (float32)
+        audio_data = indata[:, 0].copy()  # Take first channel if stereo
+
+        # Update audio level monitoring from mic
+        if len(audio_data) > 0:
+            self._peak_level = max(self._peak_level, float(np.abs(audio_data).max()))
+            self._rms_level = float(np.sqrt(np.mean(audio_data ** 2)))
+
+        with self._lock:
+            if self._recording:
+                self._mic_data.append(audio_data)
+
     def start(self) -> Path:
         """Start recording system audio.
 
@@ -101,7 +126,23 @@ class AudioRecorder:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._current_file = self.recordings_dir / f"recording_{timestamp}.wav"
         self._audio_data = []
+        self._mic_data = []
         self._error = None
+
+        # Start microphone capture if enabled (using sounddevice)
+        if self.capture_microphone:
+            try:
+                import sounddevice as sd
+                self._mic_stream = sd.InputStream(
+                    samplerate=self.sample_rate,
+                    channels=1,
+                    dtype='float32',
+                    callback=self._mic_callback,
+                    blocksize=int(self.sample_rate * 0.1),  # 100ms blocks
+                )
+                self._mic_stream.start()
+            except Exception as e:
+                self._error = f"Microphone error: {e}"
 
         # Get shareable content
         content = self._get_shareable_content()
@@ -122,10 +163,8 @@ class AudioRecorder:
         config.setExcludesCurrentProcessAudio_(True)  # Don't capture our own audio
         config.setSampleRate_(self.sample_rate)
         config.setChannelCount_(self.channels)
-
-        # Optionally capture microphone input
-        if self.capture_microphone:
-            config.setCaptureMicrophone_(True)
+        # Note: We don't use ScreenCaptureKit's captureMicrophone - it doesn't work reliably
+        # Instead we use sounddevice for mic capture
 
         # Minimize video capture since we only want audio
         config.setCaptureResolution_(SCCaptureResolutionNominal)
@@ -177,7 +216,7 @@ class AudioRecorder:
         return self._current_file
 
     def _handle_audio(self, sample_buffer):
-        """Handle incoming audio samples."""
+        """Handle incoming audio samples from ScreenCaptureKit (system audio)."""
         if not self._recording:
             return
 
@@ -208,6 +247,11 @@ class AudioRecorder:
                 # Convert to numpy array (float32 samples)
                 audio_data = np.frombuffer(bytes(filled_buffer), dtype=np.float32).copy()
 
+                # Update audio level monitoring (only if mic not capturing, to avoid overwriting)
+                if not self.capture_microphone and len(audio_data) > 0:
+                    self._peak_level = max(self._peak_level, float(np.abs(audio_data).max()))
+                    self._rms_level = float(np.sqrt(np.mean(audio_data ** 2)))
+
                 with self._lock:
                     if self._recording:
                         self._audio_data.append(audio_data)
@@ -226,7 +270,13 @@ class AudioRecorder:
 
         self._recording = False
 
-        # Stop the stream
+        # Stop microphone stream
+        if self._mic_stream:
+            self._mic_stream.stop()
+            self._mic_stream.close()
+            self._mic_stream = None
+
+        # Stop the ScreenCaptureKit stream
         if self._stream:
             stop_event = threading.Event()
 
@@ -243,14 +293,32 @@ class AudioRecorder:
 
             self._stream = None
 
-        # Save the recorded audio
+        # Combine and save the recorded audio
         with self._lock:
-            if self._audio_data:
-                audio_array = np.concatenate(self._audio_data)
-                self._save_wav(audio_array)
-                return self._current_file
+            # Get system audio
+            system_audio = np.concatenate(self._audio_data) if self._audio_data else np.array([], dtype=np.float32)
 
-        return None
+            # Get microphone audio
+            mic_audio = np.concatenate(self._mic_data) if self._mic_data else np.array([], dtype=np.float32)
+
+            # Mix or select audio
+            if len(mic_audio) > 0 and len(system_audio) > 0:
+                # Mix both: align lengths and add together
+                min_len = min(len(system_audio), len(mic_audio))
+                mixed = system_audio[:min_len] + mic_audio[:min_len]
+                # Clip to prevent clipping
+                mixed = np.clip(mixed, -1.0, 1.0)
+                self._save_wav(mixed)
+            elif len(mic_audio) > 0:
+                # Mic only
+                self._save_wav(mic_audio)
+            elif len(system_audio) > 0:
+                # System audio only
+                self._save_wav(system_audio)
+            else:
+                return None
+
+            return self._current_file
 
     def _save_wav(self, audio_data: np.ndarray):
         """Save audio data to WAV file."""
@@ -274,14 +342,31 @@ class AudioRecorder:
     def get_recording_duration(self) -> float:
         """Get the current recording duration in seconds."""
         with self._lock:
-            if not self._audio_data:
+            # Use mic data length if capturing mic, otherwise system audio
+            if self.capture_microphone and self._mic_data:
+                total_samples = sum(len(chunk) for chunk in self._mic_data)
+            elif self._audio_data:
+                total_samples = sum(len(chunk) for chunk in self._audio_data)
+            else:
                 return 0.0
-            total_samples = sum(len(chunk) for chunk in self._audio_data)
             return total_samples / self.sample_rate
 
     def get_error(self) -> Optional[str]:
         """Get any error that occurred during recording."""
         return self._error
+
+    def get_audio_levels(self) -> tuple[float, float]:
+        """Get current audio levels for monitoring.
+
+        Returns:
+            Tuple of (peak_level, rms_level) where values are 0.0-1.0.
+            Peak is the max amplitude seen, RMS is root mean square of recent audio.
+        """
+        return (self._peak_level, self._rms_level)
+
+    def reset_peak_level(self):
+        """Reset the peak level tracker."""
+        self._peak_level = 0.0
 
 
 # Get the SCStreamOutput protocol

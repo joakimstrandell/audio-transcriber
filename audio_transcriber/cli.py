@@ -150,7 +150,8 @@ def transcribe(audio_file: Path, model: str, language: Optional[str]):
 @click.option("--language", "-l", default=None, help="Language code (e.g., 'en', 'sv'). Auto-detects if not specified.")
 @click.option("--mic", is_flag=True, help="Also capture microphone input")
 @click.option("--chunk", "-c", default=5.0, help="Chunk duration in seconds for streaming (default: 5.0)")
-def stream(model: str, language: Optional[str], mic: bool, chunk: float):
+@click.option("--no-vad", is_flag=True, help="Disable Voice Activity Detection (try if mic not transcribing)")
+def stream(model: str, language: Optional[str], mic: bool, chunk: float, no_vad: bool):
     """Start recording with real-time streaming transcription.
 
     Uses faster-whisper to transcribe audio in chunks while recording continues.
@@ -173,6 +174,7 @@ def stream(model: str, language: Optional[str], mic: bool, chunk: float):
         language=language,
         capture_microphone=mic,
         chunk_duration=chunk,
+        vad_filter=not no_vad,
     )
 
     mic_status = " + microphone" if mic else ""
@@ -206,15 +208,23 @@ def stream(model: str, language: Optional[str], mic: bool, chunk: float):
                 # Build the display
                 display = Text()
 
-                # Status line
+                # Status line with audio level
                 error = streamer.get_error()
-                if error:
-                    display.append("Recording... ", style="bold red")
-                    display.append(f"{minutes:02d}:{seconds:02d}", style="bold cyan")
-                    display.append(f" [Warning: {error}]", style="yellow")
+                peak, rms = streamer.get_audio_levels()
+
+                display.append("Recording... ", style="bold red")
+                display.append(f"{minutes:02d}:{seconds:02d}", style="bold cyan")
+
+                # Show audio level indicator
+                level_bars = int(rms * 20)  # 0-20 bars based on RMS
+                level_str = "█" * level_bars + "░" * (20 - level_bars)
+                if rms > 0.01:
+                    display.append(f"  [{level_str}]", style="green")
                 else:
-                    display.append("Recording... ", style="bold red")
-                    display.append(f"{minutes:02d}:{seconds:02d}", style="bold cyan")
+                    display.append(f"  [{level_str}]", style="dim")
+
+                if error:
+                    display.append(f" [Warning: {error}]", style="yellow")
 
                 display.append("\n\n")
 
